@@ -1,6 +1,7 @@
 import numpy as np
 from astropy.io import fits
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 from astropy.wcs import WCS
 from scipy.optimize import least_squares
 import corner
@@ -12,7 +13,7 @@ def physical_to_cholesky(fwhm_maj, fwhm_min, pa_deg):
     sigma_maj = fwhm_maj / (2 * np.sqrt(2 * np.log(2)))
     sigma_min = fwhm_min / (2 * np.sqrt(2 * np.log(2)))
 
-    theta_rad = np.radians(90.0 - pa_deg)
+    theta_rad = np.radians(90.0 + pa_deg)
     cos_t = np.cos(theta_rad)
     sin_t = np.sin(theta_rad)
     R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
@@ -45,7 +46,7 @@ def cholesky_to_physical(L11, L21, L22):
     fwhm_min = sigma_min * factor
 
     theta_rad = 0.5 * np.arctan2(2 * c_xy, c_xx - c_yy)
-    pa_deg = 90.0 - np.degrees(theta_rad)
+    pa_deg = np.degrees(theta_rad) - 90.0
     pa_deg = (pa_deg + 90) % 180 - 90
 
     return fwhm_maj, fwhm_min, pa_deg
@@ -112,7 +113,6 @@ def gaussian_residuals(
     model = evaluate_gaussian_cholesky(
         shape, p["amplitude"], float(x_pix), float(y_pix), L11_pix, L21_pix, L22_pix
     )
-
     return ((model - data) / rms).flatten()
 
 
@@ -120,13 +120,36 @@ def fit(
     im_data=None,
     wcs_data=None,
     pixscale=0.01,  # arcsec/pixel
-    rms0=1e-6,  # Jy/beam
+    rms0=None,  # Jy/beam
     init_phys=None,  #
     optimizer="least_squares",
     run_sampler=True,
     uplimit_gauss_stddev=1.0,
     centroid_domain=1 / 3600,  # 1arcsec
+    with_plot=True,
+    fit_flags=None,
 ):
+    if rms0 is None:
+        rms0 = np.std(im_data[np.isfinite(im_data)])
+
+    print("\n--- Initial Guess Physical Parameters ---")
+    physical_keys = [
+        "amplitude",
+        "ra",
+        "dec",
+        "fwhm_maj_arcsec",
+        "fwhm_min_arcsec",
+        "pa_deg",
+    ]
+    for key in physical_keys:
+        if key == "amplitude":
+            print(f"{key:>15}: {init_phys[key]:.3e}")
+        elif key in ["ra", "dec"]:
+            print(f"{key:>15}: {init_phys[key]:.6f} deg")
+        else:
+            print(f"{key:>15}: {init_phys[key]:.6f}")
+
+    image_shape = im_data.shape
     L11_0, L21_0, L22_0 = physical_to_cholesky(
         init_phys["fwhm_maj_arcsec"], init_phys["fwhm_min_arcsec"], init_phys["pa_deg"]
     )
@@ -151,19 +174,22 @@ def fit(
         "L22": False,
     }
 
+    if fit_flags is not None:
+        fixed_flags.update(fit_flags)
+
     free_keys = [k for k, is_fixed in fixed_flags.items() if not is_fixed]
     fixed_dict = {
         k: initial_params[k] for k, is_fixed in fixed_flags.items() if is_fixed
     }
 
-    print(f"Fitting {len(free_keys)} free parameters using {OPTIMIZER}...")
+    print(f"Fitting {len(free_keys)} free parameters using {optimizer}...")
     final_params = fixed_dict.copy()
 
     # ==========================================
     # OPTIMIZER BLOCK
     # ==========================================
 
-    if OPTIMIZER == "least_squares":
+    if optimizer == "least_squares":
         ls_bounds = {
             "amplitude": (0.0, np.inf),
             "ra": (0.0, 360.0),
@@ -257,7 +283,7 @@ def fit(
                     if not is_param_fixed
                     else "(Fixed)"
                 )
-                print(f"{key:>15}: {phys_val_dict[key]:.6f} deg {err_str}")
+                print(f"{key:>15}: {phys_val_dict[key]:.8f} deg {err_str}")
 
             else:
                 err_str = (
@@ -265,10 +291,15 @@ def fit(
                 )
                 print(f"{key:>15}: {phys_val_dict[key]:.6f} {err_str}")
 
-    elif OPTIMIZER == "nautilus":
+    elif optimizer == "nautilus":
         # Bounding prior volume (+/- 0.01 deg is approx 36 arcsec search box for centroid)
+
+        # Ensure the upper limit is at least 3x the user's initial guess
+        dynamic_uplimit = max(uplimit_gauss_stddev, init_phys["fwhm_maj_arcsec"] * 3.0)
+
+        # Bounding prior volume
         prior_bounds = {
-            "amplitude": (1e-6, 1e-2),
+            "amplitude": (1e-6, 1e-2),  # You might want to scale this dynamically too!
             "ra": (
                 init_phys["ra"] - centroid_domain,
                 init_phys["ra"] + centroid_domain,
@@ -277,10 +308,25 @@ def fit(
                 init_phys["dec"] - centroid_domain,
                 init_phys["dec"] + centroid_domain,
             ),
-            "L11": (1e-4, uplimit_gauss_stddev),
-            "L21": (-uplimit_gauss_stddev, uplimit_gauss_stddev),
-            "L22": (1e-4, uplimit_gauss_stddev),
+            "L11": (1e-4, dynamic_uplimit),
+            "L21": (-dynamic_uplimit, dynamic_uplimit),
+            "L22": (1e-4, dynamic_uplimit),
         }
+
+        # prior_bounds = {
+        #     "amplitude": (1e-6, 1e-2),
+        #     "ra": (
+        #         init_phys["ra"] - centroid_domain,
+        #         init_phys["ra"] + centroid_domain,
+        #     ),
+        #     "dec": (
+        #         init_phys["dec"] - centroid_domain,
+        #         init_phys["dec"] + centroid_domain,
+        #     ),
+        #     "L11": (1e-4, uplimit_gauss_stddev),
+        #     "L21": (-uplimit_gauss_stddev, uplimit_gauss_stddev),
+        #     "L22": (1e-4, uplimit_gauss_stddev),
+        # }
 
         def prior_transform(u):
             x = np.zeros_like(u)
@@ -369,8 +415,16 @@ def fit(
             else:
                 final_params[key] = median
 
+
             if key == "amplitude":
                 print(f"{key:>15}: {median:.3e} (+{err_plus:.3e} / -{err_minus:.3e})")
+            elif key in ["ra", "dec"]:
+                err_plus_arcsec = err_plus * 3600.0
+                err_minus_arcsec = err_minus * 3600.0
+                print(
+                    f"{key:>15}: {median:.8f} deg "
+                    f"(+{err_plus_arcsec:.6f} / -{err_minus_arcsec:.6f} arcsec)"
+                )
             else:
                 print(f"{key:>15}: {median:.6f} (+{err_plus:.6f} / -{err_minus:.6f})")
 
@@ -397,7 +451,7 @@ def fit(
     # ==========================================
     # COMMON VISUALIZATION BLOCK
     # ==========================================
-    if OPTIMIZER == "least_squares":
+    if optimizer == "least_squares":
         maj_eval, min_eval, pa_eval = cholesky_to_physical(
             final_params["L11"], final_params["L21"], final_params["L22"]
         )
@@ -423,56 +477,97 @@ def fit(
         L22_f,
     )
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-    vmin, vmax = np.percentile(im_data, [5, 99.5])
+    final_phys_params = {
+        "amplitude": final_params.get("amplitude", np.nan),
+        "ra": final_params.get("ra", np.nan),
+        "dec": final_params.get("dec", np.nan),
+        "fwhm_maj_arcsec": maj_eval,
+        "fwhm_min_arcsec": min_eval,
+        "pa_deg": pa_eval,
+    }
 
-    im1 = ax1.imshow(im_data, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
-    ax1.set_title("Data")
-    plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+    if with_plot:
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+        vmin, vmax = np.percentile(im_data, [5, 99.5])
 
-    im2 = ax2.imshow(
-        best_fit_image, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax
-    )
-    ax2.set_title(f"Best Fit Model ({OPTIMIZER})")
-    plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        im1 = ax1.imshow(im_data, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax)
+        ax1.set_title("Data")
+        plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
-    im3 = ax3.imshow(
-        (im_data - best_fit_image) / rms0, origin="lower", cmap="RdBu", vmin=-5, vmax=5
-    )
-    ax3.set_title("Residuals (S/N)")
-    plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04, label=r"$\sigma$")
+        im2 = ax2.imshow(
+            best_fit_image, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax
+        )
+        ax2.set_title(f"Best Fit Model ({optimizer})")
 
-    plt.tight_layout()
-    plt.show()
+        ellipse = Ellipse(
+            xy=(float(fit_x_pix), float(fit_y_pix)),
+            width=maj_eval / pixscale,
+            height=min_eval / pixscale,
+            angle=90 + pa_eval,
+            edgecolor="white",
+            fc="None",
+            lw=1,
+        )
+        ax2.add_patch(ellipse)
+
+        plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+        residuals = (im_data - best_fit_image) / rms0
+        finite_residuals = residuals[np.isfinite(residuals)]
+        im3 = ax3.imshow(
+            residuals,
+            origin="lower",
+            cmap="RdBu",
+            vmin=np.min(finite_residuals),
+            vmax=np.max(finite_residuals),
+        )
+        ax3.set_title("Residuals (S/N)")
+        plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04, label=r"$\sigma$")
+
+        plt.tight_layout()
+        plt.show(block=False)
+
+    return best_fit_image, final_phys_params
 
 
 if __name__ == "__main__":
     # ==========================================
     # 0. SELECT OPTIMIZER ('least_squares' or 'nautilus')
     # ==========================================
-    OPTIMIZER = "least_squares"
-    OPTIMIZER = "nautilus"
+    optimizer = "nautilus"
 
     # --- 1. Load FITS template ---
-    hdu = fits.open("view.fits")
+    hdu = fits.open("view_whole.fits")
     image_shape = hdu[0].data.shape
     hdr0 = hdu[0].header
-    im_data = hdu[0].data
+
+    # im_data = hdu[0].data
+    im_data = np.squeeze(hdu[0].data)
+    image_shape = im_data.shape
     wcs_data = WCS(hdr0)
 
     pixscale = np.abs(hdr0["CDELT1"]) * 3600.0
-    rms0 = 5e-5
+    rms0 = 6.563e-05
 
     # --- 2. Initial Physical Parameters ---
     init_phys = {
         "amplitude": 3.7e-4,
-        "ra": 212.042015159081,
-        "dec": -41.3980530339077,
+        "ra": 212.04201760,
+        "dec": -41.39805281,
         "fwhm_maj_arcsec": 0.064,
         "fwhm_min_arcsec": 0.058,
         "pa_deg": -88.3,
     }
     uplimit_gauss_stddev = init_phys["fwhm_maj_arcsec"] * 2.0
+
+    fit_flags = {
+        "amplitude": False,
+        "ra": False,  
+        "dec": False,  
+        "L11": True,
+        "L21": True,
+        "L22": True,
+    }
 
     fit(
         im_data=im_data,
@@ -480,7 +575,8 @@ if __name__ == "__main__":
         pixscale=pixscale,
         rms0=rms0,
         init_phys=init_phys,
-        optimizer=OPTIMIZER,
-        run_sampler=False,  # Set to True to run Nautilus sampling, False to load previous results
+        fit_flags=fit_flags,
+        optimizer=optimizer,
+        run_sampler=True,  # Set to True to run Nautilus sampling, False to load previous results
         uplimit_gauss_stddev=uplimit_gauss_stddev,
     )
