@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: mgauss-fit
+Version: 0.1.0
+Summary: A package to fit a 2D Gaussian to an astronomical image.
+Requires-Python: >=3.8
+Requires-Dist: numpy
+Requires-Dist: astropy
+Requires-Dist: matplotlib
+Requires-Dist: scipy
+Requires-Dist: corner
+Requires-Dist: nautilus-sampler
+
+beam fit:
+      amplitude: 5.009e-04 (+1.215e-04 / -1.003e-04)
+             ra: 212.04201637 deg (+0.013835 / -0.015188 arcsec)
+            dec: -41.39805300 deg (+0.011137 / -0.011362 arcsec)
+        flux_jy: 5.009e-04 +/- 1.109e-04

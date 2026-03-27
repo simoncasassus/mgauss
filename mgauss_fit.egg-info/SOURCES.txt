@@ -1,0 +1,11 @@
+README
+pyproject.toml
+mgauss/__init__.py
+mgauss/cli.py
+mgauss/fit.py
+mgauss_fit.egg-info/PKG-INFO
+mgauss_fit.egg-info/SOURCES.txt
+mgauss_fit.egg-info/dependency_links.txt
+mgauss_fit.egg-info/entry_points.txt
+mgauss_fit.egg-info/requires.txt
+mgauss_fit.egg-info/top_level.txt

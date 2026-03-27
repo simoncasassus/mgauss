@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mgauss-fit"
+version = "0.1.0"
+description = "A package to fit a 2D Gaussian to an astronomical image."
+readme = "README"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "astropy",
+    "matplotlib",
+    "scipy",
+    "corner",
+    "nautilus-sampler",
+]
+
+[project.scripts]
+run-mgauss-fit = "mgauss.cli:main"
