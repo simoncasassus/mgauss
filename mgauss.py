@@ -104,7 +104,10 @@ def gaussian_residuals(
     for key, val in zip(free_keys, free_params_array):
         p[key] = val
 
-    x_pix, y_pix = wcs_data.wcs_world2pix(p["ra"], p["dec"], 0)
+    crval1, crval2 = wcs_data.wcs.crval
+    ra_deg = crval1 + p["ra_offset_arcsec"] / (3600.0 * np.cos(np.radians(crval2)))
+    dec_deg = crval2 + p["dec_offset_arcsec"] / 3600.0
+    x_pix, y_pix = wcs_data.wcs_world2pix(ra_deg, dec_deg, 0)
 
     L11_pix = p["L11"] / pixscale
     L21_pix = p["L21"] / pixscale
@@ -119,35 +122,62 @@ def gaussian_residuals(
 def fit(
     im_data=None,
     wcs_data=None,
+    hdr=None,
     pixscale=0.01,  # arcsec/pixel
     rms0=None,  # Jy/beam
     init_phys=None,  #
     optimizer="least_squares",
     run_sampler=True,
     uplimit_gauss_stddev=1.0,
-    centroid_domain=1 / 3600,  # 1arcsec
+    correlated_noise_correction=True,
     with_plot=True,
     fit_flags=None,
 ):
+    bunit = ""
+    if hdr and "BUNIT" in hdr:
+        bunit = hdr["BUNIT"]
+
+    crval1, crval2 = wcs_data.wcs.crval
+
     if rms0 is None:
         rms0 = np.std(im_data[np.isfinite(im_data)])
+
+    if "BMAJ" in hdr.keys() and "BMIN" in hdr.keys():
+        beam_maj_arcsec = hdr["BMAJ"]*3600.
+        beam_min_arcsec = hdr["BMIN"]*3600.
+        beam_area_arcsec2 = (np.pi * beam_maj_arcsec * beam_min_arcsec) / (
+            4 * np.log(2)
+        )
+        pixel_area_arcsec2 = pixscale**2
+        pixels_per_beam = beam_area_arcsec2 / pixel_area_arcsec2
+
+        if correlated_noise_correction:
+            ## sqrt(2) for a Gaussian beam. If the beam were a top-hat, we would use pixels_per_beam directly without the sqrt(2) factor.
+            error_correction_factor = np.sqrt(pixels_per_beam)/np.sqrt(2)
+            print(f"\n--- Correlated Noise Correction ---")
+            print(f"Number of pixels per beam area: {pixels_per_beam:.2f}")
+            print(f"Uncertainty correction factor: {error_correction_factor:.2f}")
+            rms0 *= error_correction_factor
+            print(f"Effective RMS for fitting: {rms0:.3e}")
+    else:
+        print("\n--- No Correlated Noise Correction Applied ---")
 
     print("\n--- Initial Guess Physical Parameters ---")
     physical_keys = [
         "amplitude",
-        "ra",
-        "dec",
+        "ra_offset_arcsec",
+        "dec_offset_arcsec",
         "fwhm_maj_arcsec",
         "fwhm_min_arcsec",
         "pa_deg",
     ]
     for key in physical_keys:
         if key == "amplitude":
-            print(f"{key:>15}: {init_phys[key]:.3e}")
-        elif key in ["ra", "dec"]:
-            print(f"{key:>15}: {init_phys[key]:.6f} deg")
+            print(f"{key:>20}: {init_phys[key]:.3e}")
+        elif key in ["ra_offset_arcsec", "dec_offset_arcsec"]:
+            print(f"{key:>20}: {init_phys[key]:.6f} arcsec")
         else:
-            print(f"{key:>15}: {init_phys[key]:.6f}")
+            print(f"{key:>20}: {init_phys[key]:.6f}")
 
     image_shape = im_data.shape
     L11_0, L21_0, L22_0 = physical_to_cholesky(
@@ -157,8 +187,8 @@ def fit(
     # Order here is strictly maintained for matrix mapping later
     initial_params = {
         "amplitude": init_phys["amplitude"],
-        "ra": init_phys["ra"],
-        "dec": init_phys["dec"],
+        "ra_offset_arcsec": init_phys["ra_offset_arcsec"],
+        "dec_offset_arcsec": init_phys["dec_offset_arcsec"],
         "L11": L11_0,
         "L21": L21_0,
         "L22": L22_0,
@@ -167,8 +197,8 @@ def fit(
     # Set to False to FIT the parameter, True to FIX it.
     fixed_flags = {
         "amplitude": False,
-        "ra": False,  # Now fitting the centroid RA!
-        "dec": False,  # Now fitting the centroid Dec!
+        "ra_offset_arcsec": False,
+        "dec_offset_arcsec": False,
         "L11": False,
         "L21": False,
         "L22": False,
@@ -192,8 +222,8 @@ def fit(
     if optimizer == "least_squares":
         ls_bounds = {
             "amplitude": (0.0, np.inf),
-            "ra": (0.0, 360.0),
-            "dec": (-90.0, 90.0),
+            "ra_offset_arcsec": (-np.inf, np.inf),
+            "dec_offset_arcsec": (-np.inf, np.inf),
             "L11": (1e-6, np.inf),
             "L21": (-np.inf, np.inf),
             "L22": (1e-6, np.inf),
@@ -227,7 +257,14 @@ def fit(
         # --- Error Propagation (Delta Method) ---
         cov_free = np.linalg.pinv(result.jac.T @ result.jac)
 
-        all_internal_keys = ["amplitude", "ra", "dec", "L11", "L21", "L22"]
+        all_internal_keys = [
+            "amplitude",
+            "ra_offset_arcsec",
+            "dec_offset_arcsec",
+            "L11",
+            "L21",
+            "L22",
+        ]
         cov_full = np.zeros((6, 6))
         free_indices = [all_internal_keys.index(k) for k in free_keys]
 
@@ -247,16 +284,16 @@ def fit(
 
         physical_keys = [
             "amplitude",
-            "ra",
-            "dec",
+            "ra_offset_arcsec",
+            "dec_offset_arcsec",
             "fwhm_maj_arcsec",
             "fwhm_min_arcsec",
             "pa_deg",
         ]
         final_phys_vals = [
             final_params["amplitude"],
-            final_params["ra"],
-            final_params["dec"],
+            final_params["ra_offset_arcsec"],
+            final_params["dec_offset_arcsec"],
             maj_f,
             min_f,
             pa_f,
@@ -275,58 +312,82 @@ def fit(
                 )
                 print(f"{key:>15}: {phys_val_dict[key]:.3e} {err_str}")
 
-            elif key in ["ra", "dec"]:
-                # Value in degrees, but convert the error to arcseconds for readability
-                err_in_arcsec = phys_err_dict[key] * 3600.0
+            elif key in ["ra_offset_arcsec", "dec_offset_arcsec"]:
                 err_str = (
-                    f"+/- {err_in_arcsec:.6f} arcsec"
+                    f"+/- {phys_err_dict[key]:.6f} arcsec"
                     if not is_param_fixed
                     else "(Fixed)"
                 )
-                print(f"{key:>15}: {phys_val_dict[key]:.8f} deg {err_str}")
+                print(f"{key:>20}: {phys_val_dict[key]:.6f} arcsec {err_str}")
 
             else:
                 err_str = (
                     f"+/- {phys_err_dict[key]:.6f}" if not is_param_fixed else "(Fixed)"
                 )
-                print(f"{key:>15}: {phys_val_dict[key]:.6f} {err_str}")
+                print(f"{key:>20}: {phys_val_dict[key]:.6f} {err_str}")
+
+        chi2 = np.sum(result.fun**2)
+        print(f"\n{'chi2':>15}: {chi2:.6f}")
+
+        # --- Integrated Flux Calculation ---
+        amp = phys_val_dict["amplitude"]
+        amp_err = phys_err_dict["amplitude"]
+        maj = phys_val_dict["fwhm_maj_arcsec"]
+        maj_err = phys_err_dict["fwhm_maj_arcsec"]
+        mini = phys_val_dict["fwhm_min_arcsec"]
+        mini_err = phys_err_dict["fwhm_min_arcsec"]
+
+        flux_factor = np.pi / (4 * np.log(2))
+        flux = flux_factor * amp * maj * mini
+        flux_label = "flux "
+
+        if "beam" in bunit.lower():
+            flux_label = "flux_jy"
+            if beam_area_arcsec2 > 0:
+                flux /= beam_area_arcsec2
+
+        term_amp = (amp_err / amp) ** 2 if amp != 0 else 0
+        term_maj = (maj_err / maj) ** 2 if maj != 0 else 0
+        term_mini = (mini_err / mini) ** 2 if mini != 0 else 0
+
+        if amp_err == 0 and maj_err == 0 and mini_err == 0:
+            flux_err_str = "(Fixed)"
+        else:
+            flux_err = abs(flux) * np.sqrt(term_amp + term_maj + term_mini)
+            flux_err_str = f"+/- {flux_err:.3e}"
+
+        print(f"{flux_label:>15}: {flux:.3e} {flux_err_str}")
 
     elif optimizer == "nautilus":
         # Bounding prior volume (+/- 0.01 deg is approx 36 arcsec search box for centroid)
 
-        # Ensure the upper limit is at least 3x the user's initial guess
-        dynamic_uplimit = max(uplimit_gauss_stddev, init_phys["fwhm_maj_arcsec"] * 3.0)
+        # For Nautilus, especially with high effective noise, the likelihood can be
+        # very flat. We use tighter priors around the initial guess to guide the
+        # sampler to the region of interest.
+        # We set the prior range to be 3x the initial Cholesky parameter values.
+        l_max = max(abs(L11_0), abs(L21_0), abs(L22_0)) * 2.0
+        l_min = min(abs(L11_0), abs(L22_0)) * 0.5
+
+        print("l_max", l_max, "l_min", l_min)
 
         # Bounding prior volume
         prior_bounds = {
-            "amplitude": (1e-6, 1e-2),  # You might want to scale this dynamically too!
-            "ra": (
-                init_phys["ra"] - centroid_domain,
-                init_phys["ra"] + centroid_domain,
+            "amplitude": (
+                0.0,
+                init_phys["amplitude"] * 2.0,
+            ),  # You might want to scale this dynamically too!
+            "ra_offset_arcsec": (
+                init_phys["ra_offset_arcsec"] - l_max,
+                init_phys["ra_offset_arcsec"] + l_max,
             ),
-            "dec": (
-                init_phys["dec"] - centroid_domain,
-                init_phys["dec"] + centroid_domain,
+            "dec_offset_arcsec": (
+                init_phys["dec_offset_arcsec"] - l_max,
+                init_phys["dec_offset_arcsec"] + l_max,
             ),
-            "L11": (1e-4, dynamic_uplimit),
-            "L21": (-dynamic_uplimit, dynamic_uplimit),
-            "L22": (1e-4, dynamic_uplimit),
+            "L11": (l_min, l_max),
+            "L21": (-l_max, l_max),
+            "L22": (l_min, l_max),
         }
-
-        # prior_bounds = {
-        #     "amplitude": (1e-6, 1e-2),
-        #     "ra": (
-        #         init_phys["ra"] - centroid_domain,
-        #         init_phys["ra"] + centroid_domain,
-        #     ),
-        #     "dec": (
-        #         init_phys["dec"] - centroid_domain,
-        #         init_phys["dec"] + centroid_domain,
-        #     ),
-        #     "L11": (1e-4, uplimit_gauss_stddev),
-        #     "L21": (-uplimit_gauss_stddev, uplimit_gauss_stddev),
-        #     "L22": (1e-4, uplimit_gauss_stddev),
-        # }
 
         def prior_transform(u):
             x = np.zeros_like(u)
@@ -348,9 +409,16 @@ def fit(
             )
             return -0.5 * np.sum(res**2)
 
-        sampler = Sampler(prior_transform, log_likelihood, n_dim=len(free_keys))
+        sampler = Sampler(
+            prior_transform,
+            log_likelihood,
+            n_dim=len(free_keys),
+            n_live=len(free_keys) * 150,
+            n_networks=16,
+        )
+
         if run_sampler:
-            sampler.run(verbose=True)
+            sampler.run(verbose=True, n_eff=1000)
             points, log_w, log_l = sampler.posterior()
             np.save("dresult_points", points)
             np.save("dresult_log_w", log_w)
@@ -360,6 +428,7 @@ def fit(
             log_w = np.load("dresult_log_w.npy", allow_pickle=True)
             log_l = np.load("dresult_log_l.npy", allow_pickle=True)
 
+        chi2 = -2 * np.max(log_l)
         weights = np.exp(log_w - np.max(log_w))
 
         # Map samples back to physical domain
@@ -371,14 +440,21 @@ def fit(
 
             maj, min_val, pa = cholesky_to_physical(p["L11"], p["L21"], p["L22"])
             physical_samples_list.append(
-                [p["amplitude"], p["ra"], p["dec"], maj, min_val, pa]
+                [
+                    p["amplitude"],
+                    p["ra_offset_arcsec"],
+                    p["dec_offset_arcsec"],
+                    maj,
+                    min_val,
+                    pa,
+                ]
             )
 
         physical_samples = np.array(physical_samples_list)
         all_physical_keys = [
             "amplitude",
-            "ra",
-            "dec",
+            "ra_offset_arcsec",
+            "dec_offset_arcsec",
             "fwhm_maj_arcsec",
             "fwhm_min_arcsec",
             "pa_deg",
@@ -387,15 +463,18 @@ def fit(
         plot_keys = []
         if "amplitude" in free_keys:
             plot_keys.append("amplitude")
-        if "ra" in free_keys:
-            plot_keys.append("ra")
-        if "dec" in free_keys:
-            plot_keys.append("dec")
+        if "ra_offset_arcsec" in free_keys:
+            plot_keys.append("ra_offset_arcsec")
+        if "dec_offset_arcsec" in free_keys:
+            plot_keys.append("dec_offset_arcsec")
         if any(k in free_keys for k in ["L11", "L21", "L22"]):
             plot_keys.extend(["fwhm_maj_arcsec", "fwhm_min_arcsec", "pa_deg"])
 
         plot_indices = [all_physical_keys.index(k) for k in plot_keys]
         plot_samples = physical_samples[:, plot_indices]
+
+        phys_val_dict = {}
+        phys_err_dict = {}
 
         print("\n--- Physical Posterior Results (Nautilus) ---")
         for i, key in enumerate(plot_keys):
@@ -406,6 +485,9 @@ def fit(
             err_minus = median - quantiles[0]
             err_plus = quantiles[2] - median
 
+            phys_val_dict[key] = median
+            phys_err_dict[key] = (err_plus + err_minus) / 2.0
+
             if key == "fwhm_maj_arcsec":
                 final_params["maj_eval"] = median
             elif key == "fwhm_min_arcsec":
@@ -415,18 +497,60 @@ def fit(
             else:
                 final_params[key] = median
 
-
             if key == "amplitude":
-                print(f"{key:>15}: {median:.3e} (+{err_plus:.3e} / -{err_minus:.3e})")
-            elif key in ["ra", "dec"]:
-                err_plus_arcsec = err_plus * 3600.0
-                err_minus_arcsec = err_minus * 3600.0
+                print(f"{key:>20}: {median:.3e} (+{err_plus:.3e} / -{err_minus:.3e})")
+            elif key in ["ra_offset_arcsec", "dec_offset_arcsec"]:
                 print(
-                    f"{key:>15}: {median:.8f} deg "
-                    f"(+{err_plus_arcsec:.6f} / -{err_minus_arcsec:.6f} arcsec)"
+                    f"{key:>20}: {median:.6f} arcsec "
+                    f"(+{err_plus:.6f} / -{err_minus:.6f} arcsec)"
                 )
             else:
-                print(f"{key:>15}: {median:.6f} (+{err_plus:.6f} / -{err_minus:.6f})")
+                print(f"{key:>20}: {median:.6f} (+{err_plus:.6f} / -{err_minus:.6f})")
+
+        print(f"\n{'chi2':>15}: {chi2:.6f}")
+
+        # Add fixed parameters to dicts for flux calculation
+        if "amplitude" not in phys_val_dict:
+            phys_val_dict["amplitude"] = initial_params["amplitude"]
+            phys_err_dict["amplitude"] = 0.0
+
+        if "fwhm_maj_arcsec" not in phys_val_dict:
+            maj, mini, pa = cholesky_to_physical(
+                initial_params["L11"], initial_params["L21"], initial_params["L22"]
+            )
+            phys_val_dict["fwhm_maj_arcsec"] = maj
+            phys_err_dict["fwhm_maj_arcsec"] = 0.0
+            phys_val_dict["fwhm_min_arcsec"] = mini
+            phys_err_dict["fwhm_min_arcsec"] = 0.0
+
+        # --- Integrated Flux Calculation ---
+        amp = phys_val_dict["amplitude"]
+        amp_err = phys_err_dict["amplitude"]
+        maj = phys_val_dict["fwhm_maj_arcsec"]
+        maj_err = phys_err_dict["fwhm_maj_arcsec"]
+        mini = phys_val_dict["fwhm_min_arcsec"]
+        mini_err = phys_err_dict["fwhm_min_arcsec"]
+
+        flux_factor = np.pi / (4 * np.log(2))
+        flux = flux_factor * amp * maj * mini
+        flux_label = "flux_jy_arcsec2"
+
+        if "beam" in bunit.lower():
+            flux_label = "flux_jy"
+            if beam_area_arcsec2 > 0:
+                flux /= beam_area_arcsec2
+
+        term_amp = (amp_err / amp) ** 2 if amp != 0 else 0
+        term_maj = (maj_err / maj) ** 2 if maj != 0 else 0
+        term_mini = (mini_err / mini) ** 2 if mini != 0 else 0
+
+        if amp_err == 0 and maj_err == 0 and mini_err == 0:
+            flux_err_str = "(Fixed)"
+        else:
+            flux_err = abs(flux) * np.sqrt(term_amp + term_maj + term_mini)
+            flux_err_str = f"+/- {flux_err:.3e}"
+
+        print(f"{flux_label:>15}: {flux:.3e} {flux_err_str}")
 
         fig = corner.corner(
             plot_samples,
@@ -460,9 +584,12 @@ def fit(
         min_eval = final_params.get("min_eval", init_phys["fwhm_min_arcsec"])
         pa_eval = final_params.get("pa_eval", init_phys["pa_deg"])
 
-    fit_x_pix, fit_y_pix = wcs_data.wcs_world2pix(
-        final_params["ra"], final_params["dec"], 0
-    )
+    ra_offset = final_params["ra_offset_arcsec"]
+    dec_offset = final_params["dec_offset_arcsec"]
+    ra_deg = crval1 + ra_offset / (3600.0 * np.cos(np.radians(crval2)))
+    dec_deg = crval2 + dec_offset / 3600.0
+
+    fit_x_pix, fit_y_pix = wcs_data.wcs_world2pix(ra_deg, dec_deg, 0)
     L11_f, L21_f, L22_f = physical_to_cholesky(
         maj_eval / pixscale, min_eval / pixscale, pa_eval
     )
@@ -479,8 +606,10 @@ def fit(
 
     final_phys_params = {
         "amplitude": final_params.get("amplitude", np.nan),
-        "ra": final_params.get("ra", np.nan),
-        "dec": final_params.get("dec", np.nan),
+        "ra_offset_arcsec": final_params.get("ra_offset_arcsec", np.nan),
+        "dec_offset_arcsec": final_params.get("dec_offset_arcsec", np.nan),
+        "ra_deg": ra_deg,
+        "dec_deg": dec_deg,
         "fwhm_maj_arcsec": maj_eval,
         "fwhm_min_arcsec": min_eval,
         "pa_deg": pa_eval,
@@ -525,7 +654,8 @@ def fit(
         plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04, label=r"$\sigma$")
 
         plt.tight_layout()
-        plt.show(block=False)
+        plt.savefig("fit_results.png")
+        plt.show()
 
     return best_fit_image, final_phys_params
 
@@ -534,8 +664,8 @@ if __name__ == "__main__":
     # ==========================================
     # 0. SELECT OPTIMIZER ('least_squares' or 'nautilus')
     # ==========================================
-    optimizer = "nautilus"
-
+    # optimizer = "nautilus"
+    optimizer = "least_squares"
     # --- 1. Load FITS template ---
     hdu = fits.open("view_whole.fits")
     image_shape = hdu[0].data.shape
@@ -547,13 +677,19 @@ if __name__ == "__main__":
     wcs_data = WCS(hdr0)
 
     pixscale = np.abs(hdr0["CDELT1"]) * 3600.0
-    rms0 = 6.563e-05
-
+    rms0 = 6.563e-05 / (9.407e-05 / 6.563e-05)
+    print("rms0", rms0)
     # --- 2. Initial Physical Parameters ---
+    init_ra_abs = 212.04201745
+    init_dec_abs = -41.39805308
+    crval1, crval2 = wcs_data.wcs.crval
+    ra_offset = (init_ra_abs - crval1) * 3600.0 * np.cos(np.radians(crval2))
+    dec_offset = (init_dec_abs - crval2) * 3600.0
+
     init_phys = {
-        "amplitude": 3.7e-4,
-        "ra": 212.04201760,
-        "dec": -41.39805281,
+        "amplitude": 3.391e-04,
+        "ra_offset_arcsec": ra_offset,
+        "dec_offset_arcsec": dec_offset,
         "fwhm_maj_arcsec": 0.064,
         "fwhm_min_arcsec": 0.058,
         "pa_deg": -88.3,
@@ -562,21 +698,23 @@ if __name__ == "__main__":
 
     fit_flags = {
         "amplitude": False,
-        "ra": False,  
-        "dec": False,  
-        "L11": True,
-        "L21": True,
-        "L22": True,
+        "ra_offset_arcsec": False,
+        "dec_offset_arcsec": False,
+        "L11": False,
+        "L21": False,
+        "L22": False,
     }
 
     fit(
         im_data=im_data,
         wcs_data=wcs_data,
+        hdr=hdr0,
         pixscale=pixscale,
         rms0=rms0,
         init_phys=init_phys,
         fit_flags=fit_flags,
         optimizer=optimizer,
+        with_plot=True,
         run_sampler=True,  # Set to True to run Nautilus sampling, False to load previous results
         uplimit_gauss_stddev=uplimit_gauss_stddev,
     )
